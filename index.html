@@ -1,0 +1,240 @@
+<html lang="en">
+
+  <head>
+    <meta charset="utf-8" />
+
+    <style>
+      body {
+        background-color: #222;
+        color: #ccc;
+      }
+    </style>
+
+    <title>MIDI Mediator</title>
+  </head>
+
+  <body>
+    <div id="app"></div>
+    <script src="app.js"></script>
+
+    <script src="cljs/midi-mediator/out/shared.js"></script>
+    <script src="cljs/midi-mediator/out/main.js"></script>
+
+    <!-- move this script to midi-utils.js -->
+    <script src="js/utils.js"></script>
+
+    <script>
+      midi_mediator.main.myfun();
+      midi_mediator.main.my_other_fun();
+      // LFO stuff
+      const noteOnMessage = [0x9f, 80, 0x7f]; 
+      const noteOffMessage = [0x8f, 80, 0x40];
+
+      function lfo_tick_fun(lfo_worker, device) {
+        return function(event){
+          if (event.data.cmd == "lfo-tick") {
+            const noteInterval = event.data.noteInterval;
+            const nextNoteTime = event.data.nextNoteTime;
+
+            console.log("here!");
+            device.send(noteOnMessage, nextNoteTime);
+            device.send(noteOffMessage, nextNoteTime + 50.0)
+
+            let currentTime = null;
+            do {
+              currentTime = window.performance.now();
+            } while (currentTime + noteInterval < nextNoteTime);
+
+            lfo_worker.postMessage({"cmd": "nextNoteTime", "nextNoteTime": currentTime + noteInterval})
+
+          } else {
+            console.log("unkown data recieved in worker", event.data);
+          }
+        }
+      }
+
+      function set_lfo_device(MIDI_ACCESS){
+        let lfo_worker = null;
+        return function (portId){
+          if (portId) {
+            lfo_worker = new Worker('js/LFO-Worker.js');
+            const lfo_device = MIDI_ACCESS.outputs.get(portId);
+
+            lfo_worker.onmessage = lfo_tick_fun(lfo_worker, lfo_device)
+            lfo_worker.postMessage({"cmd": "on", "initialTime": window.performance.now()});
+
+          } else {
+            lfo_worker.postMessage({"cmd": "off"});
+            lfo_worker = null;
+          }
+        }
+      }
+    </script>
+
+    <script>
+      // external tempo
+      function derive_avg_time(first, rest) {
+        let deltas = [];
+
+        rest.forEach(t => {
+          deltas.push(t - first);
+          first = t;
+        });
+
+        return deltas.reduce((a,b)=>a+b,0) / deltas.length;
+      }
+
+      function externalTempoSync(MIDI_ACCESS, elm_setExternalTempo){
+        let externalTempoDevice = null;
+
+        return function (portId) {
+          if (!portId) {
+            console.log("use internal tempo");
+            externalTempoDevice = null;
+          } else {
+            externalTempoDevice = MIDI_ACCESS.inputs.get(portId);
+            const lookahead_quarters = 16;
+            const ticks_per_quarter = 24;
+            const expected_window = (ticks_per_quarter * lookahead_quarters);
+
+            let ms_to_bpm = (ms_interval) => Math.round(10 * 60000.0 / (ticks_per_quarter * ms_interval)) / 10.0;
+
+            let clock_event_timestamps = [];
+            let bpm = 0;
+
+            externalTempoDevice.onmidimessage = (midi_event) => {
+              // TODO: need solution for midi type clock... and what do we do with the rest of the events....?
+              clock_event_timestamps.push(midi_event.timeStamp);
+              let derived_bpm = bpm;
+
+              if (clock_event_timestamps.length >= expected_window) {
+                let first = clock_event_timestamps.shift(); // shift removes the head of the list (in-place mutation)
+                let avg = derive_avg_time(first, clock_event_timestamps);
+                derived_bpm = ms_to_bpm(avg);
+
+              } else if (clock_event_timestamps.length >= 4) {
+                let first = clock_event_timestamps.shift(); // shift removes the head of the list (in-place mutation)
+                let avg = derive_avg_time(first, clock_event_timestamps);
+                clock_event_timestamps.unshift(first); // adds back head of list, to the head of the list
+                derived_bpm = ms_to_bpm(avg);
+
+              }
+              elm_setExternalTempo(derived_bpm);
+            }
+          }
+        }
+      }
+    </script>
+
+    <script>
+      let MIDI_ACCESS = null;
+      let elmApp = Elm.Main.init({node: document.getElementById("app")});
+
+      elmApp.ports.errorAlert.subscribe(message => {
+        console.log(message);
+        alert(message);
+      });
+
+      const ms_in_port = "0317A7370DA9957C99403E30C8298614B12BCF96B5DD3864B3467BA3A397D72E";
+      let ms = null;
+
+      // TODO move into utils.js
+      function makeDevice(device){
+        return { "name": device.name
+               , "manufacturer": device.manufacturer
+               , "portId": device.id
+               , "version": device.version
+               , "connection": device.connection};}
+
+      function updateDevices(){
+        const outputs = mapIterator(makeDevice, MIDI_ACCESS.outputs);
+        const inputs = mapIterator(makeDevice, MIDI_ACCESS.inputs);
+        elmApp.ports.all_MIDI_Devices.send(
+          { "output_devices": outputs
+          , "input_devices": inputs});
+      }
+
+      let clock_event_timestamps = [];
+      let derived_bpm = 0;
+      // TODO make MIDI clock lookahead configureable by user...
+      const ticks_per_quarter = 24;
+
+      let ts1 = window.performance.now();
+
+      function initJS(midiAccess) {
+        MIDI_ACCESS = midiAccess;
+        MIDI_ACCESS.onstatechange = (event) => updateDevices();
+        updateDevices();
+
+        //midi_mediator.main.fancy_fun(MIDI_ACCESS);
+        //midi_mediator.main.send_note(MIDI_ACCESS);
+        //midi_mediator.main.set_lfo_device(MIDI_ACCESS)("8837D4A7553916ADF0351EB34983F5F9DBF3B8526C9CE5CE6EC9F2E1E233FC2F");
+
+        //elmApp.ports.set_LFO_Device.subscribe(set_lfo_device(MIDI_ACCESS));
+        elmApp.ports.set_LFO_Device.subscribe(midi_mediator.main.set_lfo_device(MIDI_ACCESS));
+
+        elmApp.ports.setTempoDevice.subscribe(externalTempoSync(MIDI_ACCESS, elmApp.ports.setExternalTempo.send));
+
+        //ms = MIDI_ACCESS.inputs.get(ms_in_port);
+        //console.log(ms);
+
+        // TODO: extract into its own fun
+        //ms.onmidimessage = (event) => {
+        //  if (!externalTempoSyncDevice){
+
+        //    clock_event_timestamps.push(event.timeStamp);
+
+        //    const lookahead_quarters = 16; // Math.max(2, Math.round( 1.2 * (derived_bpm - 50.0) / 10.0) + 1);
+
+        //    const expected_window = (ticks_per_quarter * lookahead_quarters);
+
+        //    if (clock_event_timestamps.length >= expected_window) {
+        //      //if (clock_event_timestamps.length > expected_window) {
+        //      //  const extra = expected_window - clock_event_timestamps.length;
+        //      //  clock_event_timestamps = clock_event_timestamps.splice(extra, expected_window);
+        //      //}
+        //      const deltas = [];
+        //      let previous = clock_event_timestamps.shift(); // shift removes the head of the list (in-place mutation)
+
+        //      clock_event_timestamps.forEach(t => {
+        //        deltas.push(t - previous);
+        //        previous = t;
+        //      });
+
+        //      const avg = deltas.reduce((a,b)=>a+b,0) / deltas.length;
+        //      derived_bpm = Math.round(10 * 60000.0 / (ticks_per_quarter * avg)) / 10.0;
+
+        //    } else if (clock_event_timestamps.length >= ticks_per_quarter) {
+        //      const deltas = [];
+        //      let previous = clock_event_timestamps[0];
+        //      for (let i = 1; i < clock_event_timestamps.length; i++) {
+        //        deltas.push(clock_event_timestamps[i] - previous);
+        //        previous = clock_event_timestamps[i];
+        //      };
+
+        //      const avg = deltas.reduce((a,b)=>a+b,0) / deltas.length;
+        //      derived_bpm = Math.round(10 * 60000.0 / (ticks_per_quarter * avg)) / 10.0;
+        //    }
+        //    //console.log("derived_bpm", derived_bpm);
+        //    elmApp.ports.setExternalTempo.send(derived_bpm);
+        //    //console.log(lookahead_quarters)
+
+        //    //console.log("ms event", event);
+        //    //console.log("ms event type", getMIDIMessageType(event.data));
+        //  }
+        //};
+      }
+
+      elmApp.ports.initializeMIDI.subscribe(function(){
+        console.log("initializing MIDI ACCESS...");
+        window.navigator.requestMIDIAccess().then(
+          initJS,
+          midiAccessError => {
+            console.log(midiAccessError);
+            alert(midiAccessError);
+          }
+        );
+      });
+    </script>
+  </body>
+</html>

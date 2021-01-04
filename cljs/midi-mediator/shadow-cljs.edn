@@ -1,0 +1,14 @@
+;; shadow-cljs configuration
+{:source-paths ["src/dev" "src/main" "src/test"]
+
+ :dependencies [[cljs-bean/cljs-bean "1.6.0"]]
+
+ :builds {:code {:target :browser
+                 :output-dir "out"
+                 :modules {:shared {:entries []}
+                           :main {:init-fn midi-mediator.main/init
+                                  :entries [midi-mediator.main]
+                                  :depends-on #{:shared}}
+                           :worker {:init-fn midi-mediator.lfo-worker/init
+                                    :web-worker true
+                                    :depends-on #{:shared}}}}}}
